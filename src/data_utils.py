@@ -67,8 +67,17 @@ def load_vehicle_positions(filepath: Path) -> pd.DataFrame:
         df = df.rename(columns={'spped': 'speed'})
     
     # Convert timestamp to datetime
+    # Timestamps are Unix timestamps (UTC), but GTFS times are in local time (EST/EDT)
+    # Convert UTC timestamps to EST/EDT for proper comparison
     if 'timestamp' in df.columns:
-        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+        # Convert UTC timestamp to timezone-aware datetime
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+        # Convert to EST/EDT timezone
+        import pytz
+        est_tz = pytz.timezone('US/Eastern')
+        df['datetime'] = df['datetime'].dt.tz_convert(est_tz)
+        # Remove timezone info for comparison with GTFS (which has no timezone)
+        df['datetime'] = df['datetime'].dt.tz_localize(None)
     
     # Convert empty strings to NaN for numeric columns
     numeric_cols = ['bearing', 'speed', 'latitude', 'longitude', 'current_stop_sequence']
@@ -117,6 +126,8 @@ def merge_vehicle_positions_with_stop_times(
 ) -> pd.DataFrame:
     """
     Merge vehicle positions with stop_times data.
+    Uses time-based matching to find the correct scheduled time when trip_id matching
+    results in large time differences.
     
     Args:
         vehicle_positions: DataFrame with vehicle position data
@@ -125,9 +136,6 @@ def merge_vehicle_positions_with_stop_times(
     Returns:
         Merged DataFrame with vehicle positions and scheduled stop information
     """
-    # Extract numeric trip_id from vehicle positions (format: "10910002140434-JUNE25" -> "10910002140434")
-    vehicle_df = vehicle_positions.copy()
-    vehicle_df['trip_id_numeric'] = vehicle_df['trip_id'].astype(str).str.split('-').str[0]
     
     # Convert stop_times trip_id to string for merging
     stop_times_df = stop_times.copy()
@@ -135,9 +143,9 @@ def merge_vehicle_positions_with_stop_times(
     
     # Merge on trip_id and stop_id/current_stop_sequence
     # First try merging on trip_id and stop_id
-    merged = vehicle_df.merge(
+    merged = vehicle_positions.merge(
         stop_times_df,
-        left_on=['trip_id_numeric', 'stop_id'],
+        left_on=['trip_id', 'stop_id'],
         right_on=['trip_id', 'stop_id'],
         how='left',
         suffixes=('', '_scheduled')
@@ -159,6 +167,72 @@ def merge_vehicle_positions_with_stop_times(
         # Combine matched and unmatched rows
         matched_rows = merged[~no_match]
         merged = pd.concat([matched_rows, unmatched_merged], ignore_index=True)
+    
+    # Calculate time difference between observation and scheduled arrival
+    # This helps identify incorrectly matched records
+    if 'datetime' in merged.columns and 'arrival_time_seconds' in merged.columns:
+        merged['actual_time_seconds'] = (
+            merged['datetime'].dt.hour * 3600 + 
+            merged['datetime'].dt.minute * 60 + 
+            merged['datetime'].dt.second
+        )
+        merged['time_diff_minutes'] = abs(merged['actual_time_seconds'] - merged['arrival_time_seconds']) / 60.0
+        
+        # If time difference is > 60 minutes, try to find a better match based on time proximity
+        large_diff_mask = merged['time_diff_minutes'] > 60
+        if large_diff_mask.any():
+            # For records with large time differences, try matching by stop_id and time proximity
+            large_diff_rows = merged[large_diff_mask].copy()
+            
+            def find_best_time_match(row, stop_times_df):
+                """Find the scheduled stop with closest arrival time for this stop_id"""
+                if pd.isna(row['stop_id']) or pd.isna(row['actual_time_seconds']):
+                    return None
+                
+                # Get all scheduled stops for this stop_id
+                stop_schedules = stop_times_df[stop_times_df['stop_id'] == row['stop_id']].copy()
+                if len(stop_schedules) == 0:
+                    return None
+                
+                # Calculate time difference
+                stop_schedules['time_diff'] = abs(stop_schedules['arrival_time_seconds'] - row['actual_time_seconds']) / 60.0
+                
+                # Find the closest match (within 2 hours)
+                best_match = stop_schedules[stop_schedules['time_diff'] < 120].sort_values('time_diff')
+                if len(best_match) > 0:
+                    return best_match.iloc[0]
+                return None
+            
+            # Try to find better matches for rows with large time differences
+            better_matches = {}
+            for idx, row in large_diff_rows.iterrows():
+                best_match = find_best_time_match(row, stop_times_df)
+                if best_match is not None and best_match['time_diff'] < row['time_diff_minutes']:
+                    # Store better match info
+                    better_matches[idx] = {
+                        'arrival_time': best_match['arrival_time'],
+                        'arrival_time_seconds': best_match['arrival_time_seconds'],
+                        'departure_time': best_match.get('departure_time', best_match['arrival_time']),
+                        'departure_time_seconds': best_match.get('departure_time_seconds', best_match['arrival_time_seconds']),
+                        'stop_sequence': best_match['stop_sequence']
+                    }
+            
+            # Update merged dataframe with better matches
+            if better_matches:
+                for idx, match_info in better_matches.items():
+                    merged.loc[idx, 'arrival_time'] = match_info['arrival_time']
+                    merged.loc[idx, 'arrival_time_seconds'] = match_info['arrival_time_seconds']
+                    merged.loc[idx, 'departure_time'] = match_info['departure_time']
+                    if 'departure_time_seconds' in merged.columns:
+                        merged.loc[idx, 'departure_time_seconds'] = match_info['departure_time_seconds']
+                    merged.loc[idx, 'stop_sequence'] = match_info['stop_sequence']
+        
+        # Clean up temporary columns
+        if 'time_diff_minutes' in merged.columns:
+            merged = merged.drop(columns=['time_diff_minutes'])
+        if 'actual_time_seconds' in merged.columns and 'actual_time_seconds' not in vehicle_positions.columns:
+            # Only drop if it was created here (features.py will create it later)
+            pass
     
     return merged
 

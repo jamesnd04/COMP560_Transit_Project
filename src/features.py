@@ -113,7 +113,8 @@ def extract_traffic_features(df: pd.DataFrame) -> pd.DataFrame:
         df['bearing_direction'] = pd.cut(
             df['bearing'],
             bins=[-1, 22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5, 360],
-            labels=['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N']
+            labels=['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'],
+            ordered = False
         )
     
     # Location features
