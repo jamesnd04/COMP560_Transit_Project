@@ -136,14 +136,40 @@ def merge_vehicle_positions_with_stop_times(
     Returns:
         Merged DataFrame with vehicle positions and scheduled stop information
     """
+    # Use full trip_id from vehicle positions (including date suffix like "-JUNE25")
+    vehicle_df = vehicle_positions.copy()
+    vehicle_df['trip_id'] = vehicle_df['trip_id'].astype(str)
     
     # Convert stop_times trip_id to string for merging
     stop_times_df = stop_times.copy()
     stop_times_df['trip_id'] = stop_times_df['trip_id'].astype(str)
     
+    # Diagnostic: Check for potential matches before merging
+    vehicle_trip_ids = set(vehicle_df['trip_id'].unique())
+    stop_times_trip_ids = set(stop_times_df['trip_id'].unique())
+    trip_overlap = len(vehicle_trip_ids.intersection(stop_times_trip_ids))
+    
+    vehicle_stop_ids = set(vehicle_df['stop_id'].dropna().astype(str).unique())
+    stop_times_stop_ids = set(stop_times_df['stop_id'].astype(str).unique())
+    stop_overlap = len(vehicle_stop_ids.intersection(stop_times_stop_ids))
+    
+    if trip_overlap == 0 or stop_overlap == 0:
+        import warnings
+        warnings.warn(
+            f"⚠️ Merge Warning: No matching identifiers found. "
+            f"Trip ID overlap: {trip_overlap}/{len(vehicle_trip_ids)} vehicle trips, "
+            f"Stop ID overlap: {stop_overlap}/{len(vehicle_stop_ids)} vehicle stops. "
+            f"This may indicate incompatible datasets or missing GTFS files (trips.txt, stops.txt).",
+            UserWarning
+        )
+    
     # Merge on trip_id and stop_id/current_stop_sequence
     # First try merging on trip_id and stop_id
-    merged = vehicle_positions.merge(
+    # Convert stop_id to string for both to ensure matching
+    vehicle_df['stop_id'] = vehicle_df['stop_id'].astype(str)
+    stop_times_df['stop_id'] = stop_times_df['stop_id'].astype(str)
+    
+    merged = vehicle_df.merge(
         stop_times_df,
         left_on=['trip_id', 'stop_id'],
         right_on=['trip_id', 'stop_id'],
@@ -151,15 +177,23 @@ def merge_vehicle_positions_with_stop_times(
         suffixes=('', '_scheduled')
     )
     
+    # Check first merge success
+    first_merge_success = merged['arrival_time'].notna().sum()
+    
     # If no match, try merging on trip_id and current_stop_sequence
     no_match = merged['arrival_time'].isna()
     if no_match.any():
+        # Convert current_stop_sequence to match stop_sequence type
+        if 'current_stop_sequence' in vehicle_df.columns:
+            vehicle_df['current_stop_sequence'] = pd.to_numeric(vehicle_df['current_stop_sequence'], errors='coerce')
+        stop_times_df['stop_sequence'] = pd.to_numeric(stop_times_df['stop_sequence'], errors='coerce')
+        
         stop_times_by_sequence = stop_times_df.groupby(['trip_id', 'stop_sequence']).first().reset_index()
         # Merge unmatched rows separately
         unmatched_rows = merged[no_match].copy()
         unmatched_merged = unmatched_rows.merge(
             stop_times_by_sequence,
-            left_on=['trip_id_numeric', 'current_stop_sequence'],
+            left_on=['trip_id', 'current_stop_sequence'],
             right_on=['trip_id', 'stop_sequence'],
             how='left',
             suffixes=('', '_seq')

@@ -110,11 +110,12 @@ def extract_traffic_features(df: pd.DataFrame) -> pd.DataFrame:
         df['has_bearing'] = df['bearing'].notna()
         df['bearing'] = df['bearing'].fillna(0)
         # Convert bearing to cardinal directions
+        # Note: 'N' appears twice (0-22.5 and 337.5-360) due to circular nature of bearing
         df['bearing_direction'] = pd.cut(
             df['bearing'],
             bins=[-1, 22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5, 360],
             labels=['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'],
-            ordered = False
+            ordered=False  # Allow duplicate labels for circular data
         )
     
     # Location features
@@ -155,7 +156,7 @@ def extract_delay_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
     # Calculate delay if we have both actual timestamp and scheduled times
-    if 'datetime' in df.columns and 'arrival_time_seconds' in df.columns:
+    if 'datetime' in df.columns and 'arrival_time_seconds' in df.columns and 'trip_id' in df.columns:
         # Get time of day in seconds from datetime
         df['actual_time_seconds'] = (
             df['datetime'].dt.hour * 3600 + 
@@ -163,10 +164,33 @@ def extract_delay_features(df: pd.DataFrame) -> pd.DataFrame:
             df['datetime'].dt.second
         )
         
-        # Calculate delay (positive = late, negative = early)
-        df['arrival_delay_seconds'] = (
-            df['actual_time_seconds'] - df['arrival_time_seconds']
-        )
+        # Calculate delay based on elapsed time from trip start, not absolute time
+        # This accounts for trips that may start at different times of day
+        # Method: Compare actual elapsed time vs scheduled elapsed time from trip start
+        
+        # Find scheduled start time (first stop) for each trip
+        if 'trip_id' in df.columns:
+            # Get first stop's scheduled time for each trip
+            trip_starts = df.groupby('trip_id')['arrival_time_seconds'].transform('min')
+            df['trip_start_scheduled_seconds'] = trip_starts
+            
+            # Calculate scheduled elapsed time from trip start to current stop
+            df['scheduled_elapsed_seconds'] = df['arrival_time_seconds'] - df['trip_start_scheduled_seconds']
+            
+            # Find actual trip start time (first observation) for each trip
+            trip_actual_starts = df.groupby('trip_id')['actual_time_seconds'].transform('min')
+            df['trip_start_actual_seconds'] = trip_actual_starts
+            
+            # Calculate actual elapsed time from trip start to current observation
+            df['actual_elapsed_seconds'] = df['actual_time_seconds'] - df['trip_start_actual_seconds']
+            
+            # Delay = (actual elapsed) - (scheduled elapsed)
+            # Positive = late, negative = early
+            df['arrival_delay_seconds'] = df['actual_elapsed_seconds'] - df['scheduled_elapsed_seconds']
+        else:
+            # Fallback to old method if trip_id not available
+            df['arrival_delay_seconds'] = df['actual_time_seconds'] - df['arrival_time_seconds']
+        
         df['arrival_delay_minutes'] = df['arrival_delay_seconds'] / 60.0
         df['is_delayed'] = df['arrival_delay_seconds'] > 0
         df['is_early'] = df['arrival_delay_seconds'] < 0
@@ -180,9 +204,25 @@ def extract_delay_features(df: pd.DataFrame) -> pd.DataFrame:
                 df['datetime'].dt.second
             )
         
-        df['departure_delay_seconds'] = (
-            df['actual_time_seconds'] - df['departure_time_seconds']
-        )
+        # Use same elapsed time method for departure delay
+        if 'trip_id' in df.columns and 'trip_start_scheduled_seconds' in df.columns:
+            # Calculate scheduled elapsed time from trip start to departure
+            df['departure_scheduled_elapsed_seconds'] = df['departure_time_seconds'] - df['trip_start_scheduled_seconds']
+            
+            # Use actual elapsed time already calculated (or calculate if not available)
+            if 'actual_elapsed_seconds' not in df.columns:
+                if 'trip_start_actual_seconds' in df.columns:
+                    df['actual_elapsed_seconds'] = df['actual_time_seconds'] - df['trip_start_actual_seconds']
+                else:
+                    trip_actual_starts = df.groupby('trip_id')['actual_time_seconds'].transform('min')
+                    df['actual_elapsed_seconds'] = df['actual_time_seconds'] - trip_actual_starts
+            
+            # Delay = (actual elapsed) - (scheduled elapsed)
+            df['departure_delay_seconds'] = df['actual_elapsed_seconds'] - df['departure_scheduled_elapsed_seconds']
+        else:
+            # Fallback to old method
+            df['departure_delay_seconds'] = df['actual_time_seconds'] - df['departure_time_seconds']
+        
         df['departure_delay_minutes'] = df['departure_delay_seconds'] / 60.0
     
     # Stop sequence comparison
